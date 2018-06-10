@@ -1,0 +1,200 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include "tm4c123gh6pm.h"
+#include <strings.h>
+
+#define BLUE_LED     (*((volatile uint32_t *)(0x42000000 + (0x400253FC-0x40000000)*32 + 2*4))) // on-board blue LED
+#define X1_COOR 0
+#define X2_COOR 496
+#define X3_COOR 496
+#define Y1_COOR 0
+#define Y2_COOR 0
+#define Y3_COOR 240
+
+uint32_t sum;
+uint8_t data[50];
+char packet[256];
+
+
+void initHw()
+{
+    // Configure HW to work with 16 MHz XTAL, PLL enabled, system clock of 40 MHz
+    SYSCTL_RCC_R = SYSCTL_RCC_XTAL_16MHZ | SYSCTL_RCC_OSCSRC_MAIN | SYSCTL_RCC_USESYSDIV | (4 << SYSCTL_RCC_SYSDIV_S);
+
+    // Note UART on port C must use APB
+    SYSCTL_GPIOHBCTL_R = 0;
+
+    // Enable GPIO port A to F peripherals
+    SYSCTL_RCGC2_R = SYSCTL_RCGC2_GPIOA | SYSCTL_RCGC2_GPIOD | SYSCTL_RCGC2_GPIOE | SYSCTL_RCGC2_GPIOF | SYSCTL_RCGC2_GPIOB | SYSCTL_RCGC2_GPIOC;
+
+    // Configure port F
+    GPIO_PORTF_DIR_R = 0x04;  // bits 2 is outputs for blue led
+    GPIO_PORTF_DR2R_R = 0x04; // set drive strength to 2mA (not needed since default configuration -- for clarity)
+    GPIO_PORTF_DEN_R = 0x04;  // enable bit 2
+
+    // Configure UART1 pins
+    SYSCTL_RCGCUART_R |= SYSCTL_RCGCUART_R1; // turn-on UART0, leave other uarts in same status
+    GPIO_PORTC_DEN_R |= 0x30;                         // default, added for clarity
+    GPIO_PORTC_AFSEL_R |= 0x30;                       // default, added for clarity
+    GPIO_PORTC_PCTL_R |= GPIO_PCTL_PC5_U1TX | GPIO_PCTL_PC4_U1RX;
+   /* GPIO_PORTA_PCTL_R |= GPIO_PCTL_PA1_U0TX | GPIO_PCTL_PA0_U0RX;
+    SYSCTL_RCGCUART_R |= SYSCTL_RCGCUART_R0; // turn-on UART0, leave other uarts in same status
+        GPIO_PORTA_DEN_R |= 0x03;                         // default, added for clarity
+        GPIO_PORTA_AFSEL_R |= 0x03;*/
+    //uart1
+    UART1_CTL_R = 0;                 // turn-off UART0 to allow safe programming
+    UART1_CC_R = UART_CC_CS_SYSCLK;                 // use system clock (40 MHz)
+    UART1_IBRD_R = 2083;            // r = 40 MHz / (Nx115.2kHz), set floor(r)=21, where N=16    //1200 BUADRATE
+    UART1_FBRD_R = 21;                               // round(fract(r)*64)=45
+    UART1_LCRH_R = UART_LCRH_WLEN_8 | UART_LCRH_FEN; // configure for 8N1 w/ 16-level FIFO
+    UART1_CTL_R = UART_CTL_TXE | UART_CTL_RXE | UART_CTL_UARTEN; // enable TX, RX, and module
+
+}
+
+void waitMicrosecond(uint32_t us)
+{
+                                                // Approx clocks per us
+  __asm("WMS_LOOP0:   MOV  R1, #6");          // 1
+  __asm("WMS_LOOP1:   SUB  R1, #1");          // 6
+  __asm("             CBZ  R1, WMS_DONE1");   // 5+1*3
+  __asm("             NOP");                  // 5
+  __asm("             B    WMS_LOOP1");       // 5*3
+  __asm("WMS_DONE1:   SUB  R0, #1");          // 1
+  __asm("             CBZ  R0, WMS_DONE0");   // 1
+  __asm("             B    WMS_LOOP0");       // 1*3
+  __asm("WMS_DONE0:");                        // ---
+                                                // 40 clocks/us + error
+}
+
+
+
+void putcUart1(char c)
+{
+    while (UART1_FR_R & UART_FR_TXFF);
+    UART1_DR_R = c;
+}
+
+// Blocking function that writes a string when the UART buffer is not full
+void putsUart1(char* str)
+{
+    uint8_t i;
+    for (i = 0; i < strlen(str); i++)
+    putcUart1(str[i]);
+}
+
+void putcUart0(char c)
+{
+    while (UART0_FR_R & UART_FR_TXFF);
+    UART0_DR_R = c;
+}
+
+// Blocking function that writes a string when the UART buffer is not full
+void putsUart0(char* str)
+{
+    uint8_t i;
+    for (i = 0; i < strlen(str); i++)
+    putcUart0(str[i]);
+}
+
+void SumWords(void* data, uint16_t size_in_bytes)
+{
+    uint8_t* pData = (uint8_t*)data;
+    uint16_t i;
+    uint8_t phase = 1;
+    uint16_t data_temp;
+    for (i = 0; i < size_in_bytes; i++)
+    {
+        if (phase)
+        {
+            data_temp = *pData;
+            sum += data_temp << 8;
+        }
+        else
+          sum += *pData;
+        phase = 1 - phase;
+        pData++;
+    }
+}
+// Completes 1's compliment addition by folding carries back uint8_to field
+uint16_t getChecksum()
+{
+    uint16_t result;
+    // this is based on rfc1071
+    while ((sum >> 16) > 0)
+      sum = (sum & 0xFFFF) + (sum >> 16);
+    result = sum & 0xFFFF;
+    return ~result;
+}
+
+void initialize_data()
+{
+    data[0] = ((X1_COOR  & 0xFF00) >> 8) + 1;
+    data[1] = (X1_COOR & 0x00FF) + 1;
+
+    data[2] = ((Y1_COOR & 0xFF00) >> 8) + 1;
+    data[3] = (Y1_COOR & 0x00FF) + 1;
+
+    data[4] = ((X2_COOR & 0xFF00) >> 8) + 1;
+    data[5] = (X2_COOR & 0x00FF) + 1;
+
+    data[6] = ((Y2_COOR & 0xFF00) >> 8) + 1;
+    data[7] = (Y2_COOR & 0x00FF) + 1;
+
+    data[8] = ((X3_COOR & 0xFF00) >> 8) + 1;
+    data[9] = (X3_COOR & 0x00FF) + 1;
+
+    data[10] = ((Y3_COOR & 0xFF00) >> 8) + 1;
+    data[11] = (Y3_COOR & 0x00FF) + 1;
+
+    data[12]='\0';
+
+}
+
+int main(void)
+{
+    uint16_t chksum;
+    uint8_t i = 0;
+    uint8_t j = 0;
+    uint8_t len;
+    sum = 0;
+    initialize_data();
+    char *data_ptr = &data[0];
+
+
+    initHw();
+    BLUE_LED = 1;
+    waitMicrosecond(100000);
+    BLUE_LED = 0;
+
+    len = 12;
+    SumWords(data_ptr,len);
+    packet[i++] = len+2;
+
+    chksum = getChecksum();
+
+    while(j < len)
+    {
+        packet[i] = *data_ptr++;
+        i++;
+        j++;
+
+    }
+
+    packet[i++] = ((chksum & 0xFF00) >> 8) ;
+    packet[i++] = (chksum & 0x00FF);
+
+    packet[i] = '\0';
+
+    while(1)
+    {
+        BLUE_LED ^= 1;
+        UART1_DR_R = 0x41;
+        UART1_DR_R = 0x42;
+        UART1_DR_R = 0x43;
+        UART1_DR_R = 0x44;
+        UART1_DR_R = 0x45;
+        putsUart1(packet);
+
+        waitMicrosecond(1500000);
+    }
+}
